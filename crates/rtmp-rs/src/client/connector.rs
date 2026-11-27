@@ -1,0 +1,698 @@
+//! RTMP client connector
+//!
+//! Low-level client for connecting to RTMP servers.
+
+use std::collections::HashMap;
+
+use bytes::{Buf, Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+use super::stream::RtmpStream;
+
+use crate::amf::AmfValue;
+use crate::error::{Error, Result};
+use crate::protocol::chunk::{ChunkDecoder, ChunkEncoder, RtmpChunk};
+use crate::protocol::constants::*;
+use crate::protocol::enhanced::{EnhancedCapabilities, EnhancedRtmpMode};
+use crate::protocol::handshake::{Handshake, HandshakeRole};
+use crate::protocol::message::{Command, ConnectParams, RtmpMessage};
+
+use super::config::{ClientConfig, ParsedUrl};
+
+/// RTMP client connector
+pub struct RtmpConnector {
+    config: ClientConfig,
+    parsed_url: ParsedUrl,
+    reader: BufReader<tokio::io::ReadHalf<RtmpStream>>,
+    writer: BufWriter<tokio::io::WriteHalf<RtmpStream>>,
+    read_buf: BytesMut,
+    write_buf: BytesMut,
+    chunk_decoder: ChunkDecoder,
+    chunk_encoder: ChunkEncoder,
+    stream_id: u32,
+    /// Negotiated E-RTMP capabilities (if E-RTMP is active)
+    enhanced_capabilities: Option<EnhancedCapabilities>,
+}
+
+impl RtmpConnector {
+    /// Connect to an RTMP server
+    pub async fn connect(config: ClientConfig) -> Result<Self> {
+        let parsed_url = config
+            .parse_url()
+            .ok_or_else(|| Error::Config("Invalid RTMP URL".into()))?;
+
+        let addr = format!("{}:{}", parsed_url.host, parsed_url.port);
+
+        let socket = timeout(config.connect_timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::Io)?;
+
+        if config.tcp_nodelay {
+            socket.set_nodelay(true)?;
+        }
+
+        let stream = if parsed_url.tls {
+            #[cfg(feature = "tls")]
+            {
+                let tls_stream = Self::wrap_tls(socket, &parsed_url.host, &config).await?;
+                RtmpStream::Tls(tls_stream)
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                return Err(Error::Config(
+                    "RTMPS requires the 'tls' feature to be enabled".into(),
+                ));
+            }
+        } else {
+            RtmpStream::Tcp(socket)
+        };
+
+        let (read_half, write_half) = tokio::io::split(stream);
+
+        let mut connector = Self {
+            config,
+            parsed_url,
+            reader: BufReader::with_capacity(64 * 1024, read_half),
+            writer: BufWriter::with_capacity(64 * 1024, write_half),
+            read_buf: BytesMut::with_capacity(64 * 1024),
+            write_buf: BytesMut::with_capacity(64 * 1024),
+            chunk_decoder: ChunkDecoder::new(),
+            chunk_encoder: ChunkEncoder::new(),
+            stream_id: 0,
+            enhanced_capabilities: None,
+        };
+
+        connector.do_handshake().await?;
+        connector.do_connect().await?;
+
+        Ok(connector)
+    }
+
+    /// Wrap a TCP stream with TLS using rustls.
+    #[cfg(feature = "tls")]
+    async fn wrap_tls(
+        socket: TcpStream,
+        host: &str,
+        config: &ClientConfig,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        use std::sync::Arc;
+        use tokio_rustls::TlsConnector;
+
+        // Install the ring crypto provider if no provider has been set yet.
+        // This is required by rustls 0.23+ when using the ring feature.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert in &config.tls_root_certs {
+            root_store
+                .add(cert.clone())
+                .map_err(|e| Error::Config(format!("Invalid TLS root certificate: {}", e)))?;
+        }
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| Error::Config(format!("Invalid TLS server name '{}': {}", host, e)))?;
+
+        let tls_stream = connector
+            .connect(server_name, socket)
+            .await
+            .map_err(Error::Io)?;
+
+        tracing::debug!(host, "TLS handshake completed");
+        Ok(tls_stream)
+    }
+
+    /// Perform handshake
+    async fn do_handshake(&mut self) -> Result<()> {
+        let mut handshake = Handshake::new(HandshakeRole::Client);
+
+        // Send C0C1
+        let c0c1 = handshake.generate_initial().ok_or(Error::Protocol(
+            crate::error::ProtocolError::InvalidChunkHeader,
+        ))?;
+        self.writer.write_all(&c0c1).await?;
+        self.writer.flush().await?;
+
+        // Wait for S0S1S2 and send C2
+        let timeout_duration = self.config.connect_timeout;
+        timeout(timeout_duration, async {
+            loop {
+                let n = self.reader.read_buf(&mut self.read_buf).await?;
+                if n == 0 {
+                    return Err(Error::ConnectionClosed);
+                }
+
+                let mut buf = Bytes::copy_from_slice(&self.read_buf);
+                if let Some(response) = handshake.process(&mut buf)? {
+                    let consumed = self.read_buf.len() - buf.len();
+                    self.read_buf.advance(consumed);
+
+                    self.writer.write_all(&response).await?;
+                    self.writer.flush().await?;
+                }
+
+                if handshake.is_done() {
+                    break;
+                }
+            }
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
+
+        Ok(())
+    }
+
+    /// Send connect command
+    async fn do_connect(&mut self) -> Result<()> {
+        let mut obj = HashMap::new();
+        obj.insert(
+            "app".to_string(),
+            AmfValue::String(self.parsed_url.app.clone()),
+        );
+        obj.insert("type".to_string(), AmfValue::String("nonprivate".into()));
+        obj.insert(
+            "flashVer".to_string(),
+            AmfValue::String(self.config.flash_ver.clone()),
+        );
+        let scheme = if self.parsed_url.tls { "rtmps" } else { "rtmp" };
+        let tc_url = format!(
+            "{}://{}:{}/{}",
+            scheme, self.parsed_url.host, self.parsed_url.port, self.parsed_url.app
+        );
+        obj.insert("tcUrl".to_string(), AmfValue::String(tc_url));
+        obj.insert("fpad".to_string(), AmfValue::Boolean(false));
+        obj.insert("capabilities".to_string(), AmfValue::Number(15.0));
+        obj.insert("audioCodecs".to_string(), AmfValue::Number(3191.0));
+        obj.insert("videoCodecs".to_string(), AmfValue::Number(252.0));
+        obj.insert("videoFunction".to_string(), AmfValue::Number(1.0));
+
+        // Add E-RTMP fields if not in LegacyOnly mode
+        let client_caps = if !matches!(self.config.enhanced_rtmp, EnhancedRtmpMode::LegacyOnly) {
+            let caps = self.config.enhanced_capabilities.to_enhanced_capabilities();
+            self.add_ertmp_fields(&mut obj, &caps);
+            Some(caps)
+        } else {
+            None
+        };
+
+        let cmd = Command {
+            name: CMD_CONNECT.to_string(),
+            transaction_id: 1.0,
+            command_object: AmfValue::Object(obj),
+            arguments: vec![],
+            stream_id: 0,
+        };
+
+        self.send_command(&cmd).await?;
+
+        // Wait for connect result
+        loop {
+            let msg = self.read_message().await?;
+            match msg {
+                RtmpMessage::Command(cmd) if cmd.name == CMD_RESULT => {
+                    // Parse server's E-RTMP response
+                    self.handle_connect_result(&cmd, client_caps.as_ref())?;
+                    break;
+                }
+                RtmpMessage::Command(cmd) if cmd.name == CMD_ERROR => {
+                    return Err(Error::Rejected("Connect rejected".into()));
+                }
+                RtmpMessage::SetChunkSize(size) => {
+                    self.chunk_decoder.set_chunk_size(size);
+                }
+                RtmpMessage::WindowAckSize(size) => {
+                    let _ = self.send_message(&RtmpMessage::WindowAckSize(size)).await;
+                }
+                RtmpMessage::SetPeerBandwidth { .. } => {}
+                _ => {}
+            }
+        }
+
+        // Set our chunk size
+        self.chunk_encoder.set_chunk_size(RECOMMENDED_CHUNK_SIZE);
+        self.send_message(&RtmpMessage::SetChunkSize(RECOMMENDED_CHUNK_SIZE))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Add E-RTMP fields to the connect command object.
+    fn add_ertmp_fields(&self, obj: &mut HashMap<String, AmfValue>, caps: &EnhancedCapabilities) {
+        // Add capsEx
+        obj.insert(
+            "capsEx".to_string(),
+            AmfValue::Number(caps.caps_ex.bits() as f64),
+        );
+
+        // Add fourCcList for compatibility (older E-RTMP implementations)
+        let mut fourcc_list: Vec<AmfValue> = Vec::new();
+
+        // Add video codecs to fourCcList
+        for codec in caps.video_codecs.keys() {
+            fourcc_list.push(AmfValue::String(codec.as_fourcc_str().to_string()));
+        }
+
+        // Add audio codecs to fourCcList
+        for codec in caps.audio_codecs.keys() {
+            fourcc_list.push(AmfValue::String(codec.as_fourcc_str().to_string()));
+        }
+
+        if !fourcc_list.is_empty() {
+            obj.insert("fourCcList".to_string(), AmfValue::Array(fourcc_list));
+        }
+
+        // Add videoFourCcInfoMap (modern E-RTMP)
+        if !caps.video_codecs.is_empty() {
+            let mut video_map: HashMap<String, AmfValue> = HashMap::new();
+            for (codec, capability) in &caps.video_codecs {
+                video_map.insert(
+                    codec.as_fourcc_str().to_string(),
+                    AmfValue::Number(capability.bits() as f64),
+                );
+            }
+            obj.insert(
+                "videoFourCcInfoMap".to_string(),
+                AmfValue::Object(video_map),
+            );
+        }
+
+        // Add audioFourCcInfoMap (modern E-RTMP)
+        if !caps.audio_codecs.is_empty() {
+            let mut audio_map: HashMap<String, AmfValue> = HashMap::new();
+            for (codec, capability) in &caps.audio_codecs {
+                audio_map.insert(
+                    codec.as_fourcc_str().to_string(),
+                    AmfValue::Number(capability.bits() as f64),
+                );
+            }
+            obj.insert(
+                "audioFourCcInfoMap".to_string(),
+                AmfValue::Object(audio_map),
+            );
+        }
+    }
+
+    /// Handle connect result and parse E-RTMP capabilities from server response.
+    fn handle_connect_result(
+        &mut self,
+        cmd: &Command,
+        client_caps: Option<&EnhancedCapabilities>,
+    ) -> Result<()> {
+        // Parse server's response for E-RTMP fields
+        let server_params = ConnectParams::from_amf(&cmd.command_object);
+
+        if server_params.has_enhanced_rtmp() {
+            // Server responded with E-RTMP capabilities
+            let server_caps = server_params.to_enhanced_capabilities();
+
+            // Intersect with our client caps to get final negotiated caps
+            let negotiated = if let Some(client) = client_caps {
+                client.intersect(&server_caps)
+            } else {
+                server_caps
+            };
+
+            if negotiated.enabled {
+                tracing::debug!(
+                    video_codecs = negotiated.video_codecs.len(),
+                    audio_codecs = negotiated.audio_codecs.len(),
+                    caps_ex = negotiated.caps_ex.bits(),
+                    "E-RTMP negotiated with server"
+                );
+                self.enhanced_capabilities = Some(negotiated);
+            }
+        } else if matches!(self.config.enhanced_rtmp, EnhancedRtmpMode::EnhancedOnly) {
+            // We required E-RTMP but server doesn't support it
+            return Err(Error::Rejected(
+                "Server does not support Enhanced RTMP".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Create a stream for publishing or playing
+    pub async fn create_stream(&mut self) -> Result<u32> {
+        let cmd = Command {
+            name: CMD_CREATE_STREAM.to_string(),
+            transaction_id: 2.0,
+            command_object: AmfValue::Null,
+            arguments: vec![],
+            stream_id: 0,
+        };
+
+        self.send_command(&cmd).await?;
+
+        // Wait for result
+        loop {
+            let msg = self.read_message().await?;
+            if let RtmpMessage::Command(result) = msg {
+                if result.name == CMD_RESULT && result.transaction_id == 2.0 {
+                    if let Some(id) = result.arguments.first().and_then(|v| v.as_number()) {
+                        self.stream_id = id as u32;
+                        return Ok(self.stream_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start playing a stream
+    pub async fn play(&mut self, stream_name: &str) -> Result<()> {
+        if self.stream_id == 0 {
+            self.create_stream().await?;
+        }
+
+        // Set buffer length
+        self.send_message(&RtmpMessage::UserControl(
+            crate::protocol::message::UserControlEvent::SetBufferLength {
+                stream_id: self.stream_id,
+                buffer_ms: self.config.buffer_length,
+            },
+        ))
+        .await?;
+
+        // Send play command
+        let cmd = Command {
+            name: CMD_PLAY.to_string(),
+            transaction_id: 0.0,
+            command_object: AmfValue::Null,
+            arguments: vec![
+                AmfValue::String(stream_name.to_string()),
+                AmfValue::Number(-2.0),  // Start: live or recorded
+                AmfValue::Number(-1.0),  // Duration: play until end
+                AmfValue::Boolean(true), // Reset
+            ],
+            stream_id: self.stream_id,
+        };
+
+        self.send_command(&cmd).await?;
+
+        // Wait for onStatus
+        loop {
+            let msg = self.read_message().await?;
+            if let RtmpMessage::Command(status) = msg {
+                if status.name == CMD_ON_STATUS {
+                    if let Some(info) = status.arguments.first().and_then(|v| v.as_object()) {
+                        if let Some(code) = info.get("code").and_then(|v| v.as_str()) {
+                            if code == NS_PLAY_START {
+                                return Ok(());
+                            } else if code.contains("Failed") || code.contains("Error") {
+                                return Err(Error::Rejected(code.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start publishing a stream
+    pub async fn publish(&mut self, stream_name: &str) -> Result<()> {
+        if self.stream_id == 0 {
+            self.create_stream().await?;
+        }
+
+        // releaseStream (some servers require this)
+        let release_cmd = Command {
+            name: CMD_RELEASE_STREAM.to_string(),
+            transaction_id: 3.0,
+            command_object: AmfValue::Null,
+            arguments: vec![AmfValue::String(stream_name.to_string())],
+            stream_id: 0,
+        };
+        self.send_command(&release_cmd).await?;
+
+        // FCPublish (some servers require this)
+        let fc_cmd = Command {
+            name: CMD_FC_PUBLISH.to_string(),
+            transaction_id: 4.0,
+            command_object: AmfValue::Null,
+            arguments: vec![AmfValue::String(stream_name.to_string())],
+            stream_id: 0,
+        };
+        self.send_command(&fc_cmd).await?;
+
+        // Send publish command
+        let cmd = Command {
+            name: CMD_PUBLISH.to_string(),
+            transaction_id: 0.0,
+            command_object: AmfValue::Null,
+            arguments: vec![
+                AmfValue::String(stream_name.to_string()),
+                AmfValue::String("live".to_string()),
+            ],
+            stream_id: self.stream_id,
+        };
+        self.send_command(&cmd).await?;
+
+        // Wait for onStatus with NetStream.Publish.Start
+        loop {
+            let msg = self.read_message().await?;
+            match msg {
+                RtmpMessage::Command(status) if status.name == CMD_ON_STATUS => {
+                    if let Some(info) = status.arguments.first().and_then(|v| v.as_object()) {
+                        if let Some(code) = info.get("code").and_then(|v| v.as_str()) {
+                            if code == NS_PUBLISH_START {
+                                return Ok(());
+                            } else if code.contains("Failed")
+                                || code.contains("Error")
+                                || code == NS_PUBLISH_BAD_NAME
+                            {
+                                return Err(Error::Rejected(code.to_string()));
+                            }
+                        }
+                    }
+                }
+                RtmpMessage::Command(cmd)
+                    if cmd.name == CMD_RESULT || cmd.name == CMD_ON_FC_PUBLISH =>
+                {
+                    // Responses to releaseStream/FCPublish - ignore
+                }
+                RtmpMessage::Command(cmd) if cmd.name == CMD_ERROR => {
+                    return Err(Error::Rejected("Publish rejected".into()));
+                }
+                RtmpMessage::SetChunkSize(size) => {
+                    self.chunk_decoder.set_chunk_size(size);
+                }
+                RtmpMessage::WindowAckSize(_) | RtmpMessage::SetPeerBandwidth { .. } => {}
+                _ => {}
+            }
+        }
+    }
+
+    /// Send audio data on the published stream.
+    ///
+    /// `data` is the FLV audio tag body (header byte + payload).
+    /// `timestamp` is in milliseconds.
+    pub async fn send_audio_data(&mut self, data: Bytes, timestamp: u32) -> Result<()> {
+        let chunk = RtmpChunk {
+            csid: CSID_AUDIO,
+            timestamp,
+            message_type: crate::protocol::constants::MSG_AUDIO,
+            stream_id: self.stream_id,
+            payload: data,
+        };
+
+        self.write_buf.clear();
+        self.chunk_encoder.encode(&chunk, &mut self.write_buf);
+        let write_timeout = std::time::Duration::from_secs(8);
+        timeout(write_timeout, async {
+            self.writer.write_all(&self.write_buf).await?;
+            self.writer.flush().await
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::Io)?;
+
+        Ok(())
+    }
+
+    /// Send video data on the published stream.
+    ///
+    /// `data` is the FLV video tag body (header bytes + AVC payload).
+    /// `timestamp` is in milliseconds.
+    pub async fn send_video_data(&mut self, data: Bytes, timestamp: u32) -> Result<()> {
+        let chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp,
+            message_type: crate::protocol::constants::MSG_VIDEO,
+            stream_id: self.stream_id,
+            payload: data,
+        };
+
+        self.write_buf.clear();
+        self.chunk_encoder.encode(&chunk, &mut self.write_buf);
+        let write_timeout = std::time::Duration::from_secs(8);
+        timeout(write_timeout, async {
+            self.writer.write_all(&self.write_buf).await?;
+            self.writer.flush().await
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::Io)?;
+
+        Ok(())
+    }
+
+    /// Send AMF0 metadata (@setDataFrame / onMetaData) on the published stream.
+    pub async fn send_metadata(&mut self, data: Bytes) -> Result<()> {
+        let chunk = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 0,
+            message_type: crate::protocol::constants::MSG_DATA_AMF0,
+            stream_id: self.stream_id,
+            payload: data,
+        };
+
+        self.write_buf.clear();
+        self.chunk_encoder.encode(&chunk, &mut self.write_buf);
+        let write_timeout = std::time::Duration::from_secs(8);
+        timeout(write_timeout, async {
+            self.writer.write_all(&self.write_buf).await?;
+            self.writer.flush().await
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::Io)?;
+
+        Ok(())
+    }
+
+    /// Poll incoming control messages from the server without blocking the media loop.
+    /// Automatically responds to PingRequest with PingResponse and updates chunk sizes.
+    pub async fn poll_incoming(&mut self) -> Result<()> {
+        loop {
+            while let Some(chunk) = self.chunk_decoder.decode(&mut self.read_buf)? {
+                let msg = RtmpMessage::from_chunk(&chunk)?;
+                match msg {
+                    RtmpMessage::SetChunkSize(size) => {
+                        self.chunk_decoder.set_chunk_size(size);
+                    }
+                    RtmpMessage::WindowAckSize(size) => {
+                        let _ = self.send_message(&RtmpMessage::WindowAckSize(size)).await;
+                    }
+                    RtmpMessage::UserControl(
+                        crate::protocol::message::UserControlEvent::PingRequest(ts),
+                    ) => {
+                        tracing::debug!(ts, "Received RTMP PingRequest, sending PingResponse");
+                        self.send_message(&RtmpMessage::UserControl(
+                            crate::protocol::message::UserControlEvent::PingResponse(ts),
+                        ))
+                        .await?;
+                    }
+                    RtmpMessage::Command(status) if status.name == CMD_ON_STATUS => {
+                        if let Some(info) = status.arguments.first().and_then(|v| v.as_object()) {
+                            if let Some(code) = info.get("code").and_then(|v| v.as_str()) {
+                                if code.contains("Failed")
+                                    || code.contains("Error")
+                                    || code == NS_PUBLISH_BAD_NAME
+                                {
+                                    return Err(Error::Rejected(code.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let read_opt = std::future::poll_fn(|cx| {
+                let mut read_fut = std::pin::pin!(self.reader.read_buf(&mut self.read_buf));
+                match std::future::Future::poll(read_fut.as_mut(), cx) {
+                    std::task::Poll::Ready(res) => std::task::Poll::Ready(Some(res)),
+                    std::task::Poll::Pending => std::task::Poll::Ready(None),
+                }
+            })
+            .await;
+
+            match read_opt {
+                Some(Ok(0)) => return Err(Error::ConnectionClosed),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(Error::Io(e)),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the next RTMP message
+    pub async fn read_message(&mut self) -> Result<RtmpMessage> {
+        loop {
+            // Try to decode from buffer
+            while let Some(chunk) = self.chunk_decoder.decode(&mut self.read_buf)? {
+                return RtmpMessage::from_chunk(&chunk);
+            }
+
+            // Need more data
+            let n = self.reader.read_buf(&mut self.read_buf).await?;
+            if n == 0 {
+                return Err(Error::ConnectionClosed);
+            }
+        }
+    }
+
+    /// Send an RTMP message
+    async fn send_message(&mut self, msg: &RtmpMessage) -> Result<()> {
+        let (msg_type, payload) = msg.encode();
+
+        let (csid, stream_id) = match msg {
+            RtmpMessage::SetChunkSize(_)
+            | RtmpMessage::Acknowledgement { .. }
+            | RtmpMessage::WindowAckSize(_)
+            | RtmpMessage::SetPeerBandwidth { .. }
+            | RtmpMessage::UserControl(_) => (CSID_PROTOCOL_CONTROL, 0),
+            RtmpMessage::Command(cmd) | RtmpMessage::CommandAmf3(cmd) => {
+                (CSID_COMMAND, cmd.stream_id)
+            }
+            _ => (CSID_COMMAND, 0),
+        };
+
+        let chunk = RtmpChunk {
+            csid,
+            timestamp: 0,
+            message_type: msg_type,
+            stream_id,
+            payload,
+        };
+
+        self.write_buf.clear();
+        self.chunk_encoder.encode(&chunk, &mut self.write_buf);
+        self.writer.write_all(&self.write_buf).await?;
+        self.writer.flush().await?;
+
+        Ok(())
+    }
+
+    /// Send a command
+    async fn send_command(&mut self, cmd: &Command) -> Result<()> {
+        self.send_message(&RtmpMessage::Command(cmd.clone())).await
+    }
+
+    /// Get the stream ID
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+
+    /// Check if E-RTMP is active for this connection
+    pub fn is_enhanced_rtmp(&self) -> bool {
+        self.enhanced_capabilities
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Get the negotiated E-RTMP capabilities
+    pub fn enhanced_capabilities(&self) -> Option<&EnhancedCapabilities> {
+        self.enhanced_capabilities.as_ref()
+    }
+}

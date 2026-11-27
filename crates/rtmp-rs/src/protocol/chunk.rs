@@ -1,0 +1,1030 @@
+//! RTMP chunk stream codec
+//!
+//! RTMP messages are split into chunks for multiplexing. Each chunk has a header
+//! that identifies the chunk stream and message being sent.
+//!
+//! ```text
+//! Chunk Format:
+//! +-------------+----------------+-------------------+
+//! | Basic Header| Message Header | Chunk Data        |
+//! | (1-3 bytes) | (0,3,7,11 bytes)| (variable)       |
+//! +-------------+----------------+-------------------+
+//!
+//! Basic Header formats:
+//! - 1 byte:  fmt(2) + csid(6)        for csid 2-63
+//! - 2 bytes: fmt(2) + 0 + csid(8)    for csid 64-319
+//! - 3 bytes: fmt(2) + 1 + csid(16)   for csid 64-65599
+//!
+//! Message Header formats (based on fmt):
+//! - Type 0 (11 bytes): timestamp(3) + length(3) + type(1) + stream_id(4)
+//! - Type 1 (7 bytes):  timestamp_delta(3) + length(3) + type(1)
+//! - Type 2 (3 bytes):  timestamp_delta(3)
+//! - Type 3 (0 bytes):  (use previous chunk's values)
+//!
+//! Extended timestamp (4 bytes) is appended when timestamp >= 0xFFFFFF
+//! ```
+//!
+//! Reference: RTMP Specification Section 5.3
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::collections::HashMap;
+
+use crate::error::{ProtocolError, Result};
+use crate::protocol::constants::*;
+
+/// A complete RTMP message (reassembled from chunks)
+#[derive(Debug, Clone)]
+pub struct RtmpChunk {
+    /// Chunk stream ID (for multiplexing)
+    pub csid: u32,
+    /// Message timestamp (milliseconds)
+    pub timestamp: u32,
+    /// Message type ID
+    pub message_type: u8,
+    /// Message stream ID
+    pub stream_id: u32,
+    /// Message payload
+    pub payload: Bytes,
+}
+
+/// Per-chunk-stream state for reassembly
+#[derive(Debug, Clone, Default)]
+struct ChunkStreamState {
+    /// Last timestamp (absolute)
+    timestamp: u32,
+    /// Last timestamp delta
+    timestamp_delta: u32,
+    /// Last message length
+    message_length: u32,
+    /// Last message type
+    message_type: u8,
+    /// Last message stream ID
+    stream_id: u32,
+    /// Whether we've received extended timestamp
+    has_extended_timestamp: bool,
+    /// Buffer for partial message reassembly
+    partial_message: BytesMut,
+    /// Expected total length of current message
+    expected_length: u32,
+}
+
+/// Chunk stream decoder
+///
+/// Handles chunk demultiplexing and message reassembly.
+pub struct ChunkDecoder {
+    /// Maximum incoming chunk size
+    chunk_size: u32,
+    /// Per-chunk-stream state
+    streams: HashMap<u32, ChunkStreamState>,
+    /// Maximum message size (sanity limit)
+    max_message_size: u32,
+}
+
+impl ChunkDecoder {
+    /// Create a new decoder with default chunk size
+    pub fn new() -> Self {
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            streams: HashMap::new(),
+            max_message_size: MAX_MESSAGE_SIZE,
+        }
+    }
+
+    /// Set the chunk size (called when receiving SetChunkSize message)
+    pub fn set_chunk_size(&mut self, size: u32) {
+        self.chunk_size = size.min(MAX_CHUNK_SIZE);
+    }
+
+    /// Get current chunk size
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    /// Try to decode a complete message from the buffer
+    ///
+    /// Returns Ok(Some(chunk)) if a complete message was decoded,
+    /// Ok(None) if more data is needed, or Err on protocol error.
+    pub fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<RtmpChunk>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        // Parse basic header to get csid and fmt (peek only, don't advance)
+        let (fmt, csid, header_len) = match self.parse_basic_header(buf)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        tracing::trace!(
+            fmt = fmt,
+            csid = csid,
+            header_len = header_len,
+            first_byte = format!("0x{:02x}", buf[0]),
+            "Parsing chunk"
+        );
+
+        // Get or create chunk stream state
+        let state = self.streams.entry(csid).or_default();
+
+        // Calculate message header size based on fmt
+        let msg_header_size = match fmt {
+            0 => 11,
+            1 => 7,
+            2 => 3,
+            3 => 0,
+            _ => return Err(ProtocolError::InvalidChunkHeader.into()),
+        };
+
+        // Check if we have enough data for headers
+        let needs_extended = if fmt == 3 {
+            state.has_extended_timestamp
+        } else if buf.len() > header_len + 2 {
+            // Peek at timestamp field to check for extended timestamp
+            let ts_bytes = &buf[header_len..header_len + 3];
+            let ts =
+                ((ts_bytes[0] as u32) << 16) | ((ts_bytes[1] as u32) << 8) | (ts_bytes[2] as u32);
+            ts >= EXTENDED_TIMESTAMP_THRESHOLD
+        } else {
+            false
+        };
+
+        let extended_size = if needs_extended { 4 } else { 0 };
+        let total_header_size = header_len + msg_header_size + extended_size;
+
+        if buf.len() < total_header_size {
+            return Ok(None); // Need more header data
+        }
+
+        // PEEK at message header to determine chunk data length BEFORE consuming anything
+        // For fmt 3, we use state values; for others, we peek at the buffer
+        let (_peeked_message_length, peeked_expected_length) = match fmt {
+            0 | 1 => {
+                // Message length is at offset: header_len + 3 (timestamp bytes)
+                let len_offset = header_len + 3;
+                let len_bytes = &buf[len_offset..len_offset + 3];
+                let len = ((len_bytes[0] as u32) << 16)
+                    | ((len_bytes[1] as u32) << 8)
+                    | (len_bytes[2] as u32);
+                (len, len)
+            }
+            2 | 3 => {
+                // Use state for message length
+                let msg_len = state.message_length;
+                let expected = if state.partial_message.is_empty() {
+                    msg_len
+                } else {
+                    state.expected_length
+                };
+                (msg_len, expected)
+            }
+            _ => unreachable!(),
+        };
+
+        // Calculate chunk data length
+        let partial_len = state.partial_message.len() as u32;
+        let remaining = peeked_expected_length.saturating_sub(partial_len);
+        let chunk_data_len = remaining.min(self.chunk_size) as usize;
+
+        // Now check if we have enough data for header + payload
+        let total_chunk_size = total_header_size + chunk_data_len;
+        if buf.len() < total_chunk_size {
+            return Ok(None); // Need more data - don't consume anything
+        }
+
+        // NOW we can safely consume the data since we have enough for the entire chunk
+        buf.advance(header_len);
+
+        let (timestamp_field, message_length, message_type, stream_id) = match fmt {
+            0 => {
+                // Full header
+                let ts = buf.get_uint(3) as u32;
+                let len = buf.get_uint(3) as u32;
+                let typ = buf.get_u8();
+                let sid = buf.get_u32_le(); // Stream ID is little-endian!
+                (ts, len, typ, sid)
+            }
+            1 => {
+                // No stream ID
+                let ts = buf.get_uint(3) as u32;
+                let len = buf.get_uint(3) as u32;
+                let typ = buf.get_u8();
+                (ts, len, typ, state.stream_id)
+            }
+            2 => {
+                // Timestamp delta only
+                let ts = buf.get_uint(3) as u32;
+                (
+                    ts,
+                    state.message_length,
+                    state.message_type,
+                    state.stream_id,
+                )
+            }
+            3 => {
+                // No header, use previous values
+                (
+                    state.timestamp_delta,
+                    state.message_length,
+                    state.message_type,
+                    state.stream_id,
+                )
+            }
+            _ => unreachable!(),
+        };
+
+        // Handle extended timestamp (we already checked we have enough bytes)
+        let timestamp = if timestamp_field >= EXTENDED_TIMESTAMP_THRESHOLD
+            || (fmt == 3 && state.has_extended_timestamp)
+        {
+            state.has_extended_timestamp = true;
+            buf.get_u32()
+        } else {
+            state.has_extended_timestamp = false;
+            timestamp_field
+        };
+
+        // Update state
+        let absolute_timestamp = if fmt == 0 {
+            timestamp
+        } else if fmt == 3 && !state.partial_message.is_empty() {
+            // continuation chunk, timestamp stays the same
+            state.timestamp
+        } else {
+            state.timestamp.wrapping_add(timestamp)
+        };
+
+        state.timestamp_delta = timestamp;
+        state.message_length = message_length;
+        state.message_type = message_type;
+        state.stream_id = stream_id;
+        state.timestamp = absolute_timestamp;
+
+        // Validate message size
+        if message_length > self.max_message_size {
+            return Err(ProtocolError::MessageTooLarge {
+                size: message_length,
+                max: self.max_message_size,
+            }
+            .into());
+        }
+
+        // Initialize reassembly buffer if this is a new message
+        if state.partial_message.is_empty() {
+            state.expected_length = message_length;
+            state.partial_message.reserve(message_length as usize);
+        }
+
+        // Read chunk data (we already verified we have enough)
+        state.partial_message.put_slice(&buf[..chunk_data_len]);
+        buf.advance(chunk_data_len);
+
+        // Check if message is complete
+        if state.partial_message.len() as u32 >= state.expected_length {
+            let payload = state.partial_message.split().freeze();
+            state.expected_length = 0;
+
+            Ok(Some(RtmpChunk {
+                csid,
+                timestamp: state.timestamp,
+                message_type: state.message_type,
+                stream_id: state.stream_id,
+                payload,
+            }))
+        } else {
+            Ok(None) // Message not yet complete
+        }
+    }
+
+    /// Parse basic header and return (fmt, csid, header_length)
+    fn parse_basic_header(&self, buf: &[u8]) -> Result<Option<(u8, u32, usize)>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        let first = buf[0];
+        let fmt = (first >> 6) & 0x03;
+        let csid_low = first & 0x3F;
+
+        match csid_low {
+            0 => {
+                // 2-byte header: csid = 64 + second byte
+                if buf.len() < 2 {
+                    return Ok(None);
+                }
+                let csid = 64 + buf[1] as u32;
+                Ok(Some((fmt, csid, 2)))
+            }
+            1 => {
+                // 3-byte header: csid = 64 + second + third*256
+                if buf.len() < 3 {
+                    return Ok(None);
+                }
+                let csid = 64 + buf[1] as u32 + (buf[2] as u32) * 256;
+                Ok(Some((fmt, csid, 3)))
+            }
+            _ => {
+                // 1-byte header: csid = 2-63
+                Ok(Some((fmt, csid_low as u32, 1)))
+            }
+        }
+    }
+
+    /// Abort a message on a chunk stream (when receiving Abort message)
+    pub fn abort(&mut self, csid: u32) {
+        if let Some(state) = self.streams.get_mut(&csid) {
+            state.partial_message.clear();
+            state.expected_length = 0;
+        }
+    }
+}
+
+impl Default for ChunkDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Chunk stream encoder
+///
+/// Encodes messages into chunks for transmission.
+pub struct ChunkEncoder {
+    /// Outgoing chunk size
+    chunk_size: u32,
+    /// Per-chunk-stream state for compression
+    streams: HashMap<u32, ChunkStreamState>,
+}
+
+impl ChunkEncoder {
+    /// Create a new encoder with default chunk size
+    pub fn new() -> Self {
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            streams: HashMap::new(),
+        }
+    }
+
+    /// Set the chunk size (call before encoding to use larger chunks)
+    pub fn set_chunk_size(&mut self, size: u32) {
+        self.chunk_size = size.min(MAX_CHUNK_SIZE);
+    }
+
+    /// Get current chunk size
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    /// Reset per-chunk-stream state (keeps the negotiated chunk size).
+    ///
+    /// Call when a session/stream ends so a reused encoder does not carry
+    /// stale timestamp/format state into a new session (a second publish on
+    /// the same connection would otherwise regress timestamps and hit the
+    /// fmt 0 issue in `select_format`).
+    pub fn reset(&mut self) {
+        self.streams.clear();
+    }
+
+    /// Encode a message into chunks
+    pub fn encode(&mut self, chunk: &RtmpChunk, buf: &mut BytesMut) {
+        let csid = chunk.csid;
+        let chunk_size = self.chunk_size;
+
+        // Get or create state, and compute format based on current state
+        let state = self.streams.entry(csid).or_default();
+
+        // Compute format based on state comparison
+        let fmt = select_format(chunk, state);
+
+        // Determine if we need extended timestamp
+        let needs_extended = chunk.timestamp >= EXTENDED_TIMESTAMP_THRESHOLD;
+        let timestamp_field = if needs_extended {
+            EXTENDED_TIMESTAMP_THRESHOLD
+        } else {
+            chunk.timestamp
+        };
+
+        let timestamp_delta = chunk.timestamp.wrapping_sub(state.timestamp);
+        let delta_field = if needs_extended {
+            EXTENDED_TIMESTAMP_THRESHOLD
+        } else {
+            timestamp_delta
+        };
+
+        let had_extended_timestamp = state.has_extended_timestamp;
+
+        // Update state before encoding
+        state.timestamp = chunk.timestamp;
+        state.timestamp_delta = timestamp_delta;
+        state.message_length = chunk.payload.len() as u32;
+        state.message_type = chunk.message_type;
+        state.stream_id = chunk.stream_id;
+        state.has_extended_timestamp = needs_extended;
+
+        // Encode chunks
+        let mut offset = 0;
+        let payload_len = chunk.payload.len();
+        let mut first_chunk = true;
+
+        while offset < payload_len {
+            let chunk_data_len = (payload_len - offset).min(chunk_size as usize);
+
+            // Write basic header
+            write_basic_header(csid, if first_chunk { fmt } else { 3 }, buf);
+
+            // Write message header based on format
+            if first_chunk {
+                match fmt {
+                    0 => {
+                        // Full header
+                        write_u24(timestamp_field, buf);
+                        write_u24(payload_len as u32, buf);
+                        buf.put_u8(chunk.message_type);
+                        buf.put_u32_le(chunk.stream_id);
+                    }
+                    1 => {
+                        // No stream ID
+                        write_u24(delta_field, buf);
+                        write_u24(payload_len as u32, buf);
+                        buf.put_u8(chunk.message_type);
+                    }
+                    2 => {
+                        // Timestamp delta only
+                        write_u24(delta_field, buf);
+                    }
+                    3 => {
+                        // No header
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            // Write extended timestamp if needed
+            if needs_extended && (first_chunk || had_extended_timestamp) {
+                buf.put_u32(chunk.timestamp);
+            }
+
+            // Write chunk data
+            buf.put_slice(&chunk.payload[offset..offset + chunk_data_len]);
+            offset += chunk_data_len;
+            first_chunk = false;
+        }
+    }
+}
+
+/// Select the best header format for compression
+fn select_format(chunk: &RtmpChunk, state: &ChunkStreamState) -> u8 {
+    // First message on this stream must use format 0
+    if state.message_type == 0 && state.stream_id == 0 {
+        return 0;
+    }
+
+    // If stream ID differs or timestamp regressed, must use format 0 (full header)
+    if chunk.stream_id != state.stream_id || chunk.timestamp < state.timestamp {
+        return 0;
+    }
+
+    // If message type or length differs, use format 1
+    if chunk.message_type != state.message_type
+        || chunk.payload.len() as u32 != state.message_length
+    {
+        return 1;
+    }
+
+    // If timestamp delta matches previous, use format 3
+    let delta = chunk.timestamp.wrapping_sub(state.timestamp);
+    if delta == state.timestamp_delta {
+        return 3;
+    }
+
+    // Otherwise use format 2 (timestamp delta only)
+    2
+}
+
+/// Write basic header
+fn write_basic_header(csid: u32, fmt: u8, buf: &mut BytesMut) {
+    if csid >= 64 + 256 {
+        // 3-byte header
+        buf.put_u8((fmt << 6) | 1);
+        let csid_offset = csid - 64;
+        buf.put_u8((csid_offset & 0xFF) as u8);
+        buf.put_u8(((csid_offset >> 8) & 0xFF) as u8);
+    } else if csid >= 64 {
+        // 2-byte header
+        buf.put_u8((fmt << 6) | 0);
+        buf.put_u8((csid - 64) as u8);
+    } else {
+        // 1-byte header
+        buf.put_u8((fmt << 6) | (csid as u8));
+    }
+}
+
+/// Write 24-bit big-endian value
+fn write_u24(value: u32, buf: &mut BytesMut) {
+    buf.put_u8(((value >> 16) & 0xFF) as u8);
+    buf.put_u8(((value >> 8) & 0xFF) as u8);
+    buf.put_u8((value & 0xFF) as u8);
+}
+
+impl Default for ChunkEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_header_parsing() {
+        let decoder = ChunkDecoder::new();
+
+        // 1-byte header (csid 2-63)
+        let buf = [0x03]; // fmt=0, csid=3
+        let result = decoder.parse_basic_header(&buf).unwrap().unwrap();
+        assert_eq!(result, (0, 3, 1));
+
+        // 2-byte header (csid 64-319)
+        let buf = [0x00, 0x00]; // fmt=0, csid=64
+        let result = decoder.parse_basic_header(&buf).unwrap().unwrap();
+        assert_eq!(result, (0, 64, 2));
+
+        // 3-byte header (csid 64-65599)
+        let buf = [0x01, 0x00, 0x01]; // fmt=0, csid=64+256
+        let result = decoder.parse_basic_header(&buf).unwrap().unwrap();
+        assert_eq!(result, (0, 320, 3));
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let original = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 1000,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"test payload data"),
+        };
+
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&original, &mut encoded);
+
+        let decoded = decoder.decode(&mut encoded).unwrap().unwrap();
+
+        assert_eq!(decoded.csid, original.csid);
+        assert_eq!(decoded.timestamp, original.timestamp);
+        assert_eq!(decoded.message_type, original.message_type);
+        assert_eq!(decoded.stream_id, original.stream_id);
+        assert_eq!(decoded.payload, original.payload);
+    }
+
+    #[test]
+    fn test_large_message_chunking() {
+        let large_payload = vec![0u8; 500]; // Larger than default chunk size (128)
+
+        let original = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from(large_payload.clone()),
+        };
+
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&original, &mut encoded);
+
+        // Should produce multiple chunks (500 bytes / 128 = ~4 chunks)
+        assert!(encoded.len() > 500);
+
+        // Decode all chunks until we get a complete message
+        let decoded = loop {
+            if let Some(chunk) = decoder.decode(&mut encoded).unwrap() {
+                break chunk;
+            }
+        };
+        assert_eq!(decoded.payload.len(), 500);
+    }
+
+    #[test]
+    fn test_chunk_size_configuration() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Check default chunk size
+        assert_eq!(encoder.chunk_size(), DEFAULT_CHUNK_SIZE);
+        assert_eq!(decoder.chunk_size(), DEFAULT_CHUNK_SIZE);
+
+        // Set new chunk size
+        encoder.set_chunk_size(4096);
+        decoder.set_chunk_size(4096);
+
+        assert_eq!(encoder.chunk_size(), 4096);
+        assert_eq!(decoder.chunk_size(), 4096);
+    }
+
+    #[test]
+    fn test_chunk_size_capped_at_max() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Try to set chunk size larger than MAX
+        encoder.set_chunk_size(u32::MAX);
+        decoder.set_chunk_size(u32::MAX);
+
+        assert_eq!(encoder.chunk_size(), MAX_CHUNK_SIZE);
+        assert_eq!(decoder.chunk_size(), MAX_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_different_chunk_stream_ids() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Test various CSIDs
+        let csids = [2, 3, 63, 64, 100, 319, 320, 1000];
+
+        for &csid in &csids {
+            let chunk = RtmpChunk {
+                csid,
+                timestamp: 1000,
+                message_type: MSG_COMMAND_AMF0,
+                stream_id: 0,
+                payload: Bytes::from_static(b"test"),
+            };
+
+            let mut encoded = BytesMut::new();
+            encoder.encode(&chunk, &mut encoded);
+
+            let decoded = decoder.decode(&mut encoded).unwrap().unwrap();
+            assert_eq!(decoded.csid, csid);
+        }
+    }
+
+    #[test]
+    fn test_extended_timestamp() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Create a chunk with timestamp >= EXTENDED_TIMESTAMP_THRESHOLD
+        let chunk = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 0xFFFFFF + 1000, // Requires extended timestamp
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"extended timestamp test"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        let decoded = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded.timestamp, 0xFFFFFF + 1000);
+    }
+
+    #[test]
+    fn test_extended_timestamp_boundary() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Test exactly at the threshold
+        let chunk = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: EXTENDED_TIMESTAMP_THRESHOLD,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"boundary test"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        let decoded = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded.timestamp, EXTENDED_TIMESTAMP_THRESHOLD);
+    }
+
+    #[test]
+    fn test_zero_timestamp() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        let chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"zero ts"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        let decoded = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded.timestamp, 0);
+    }
+
+    #[test]
+    fn test_abort_clears_partial_message() {
+        let mut decoder = ChunkDecoder::new();
+
+        // Simulate receiving part of a large message
+        let large_chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from(vec![0u8; 500]),
+        };
+
+        let mut encoder = ChunkEncoder::new();
+        let mut encoded = BytesMut::new();
+        encoder.encode(&large_chunk, &mut encoded);
+
+        // Take only the first 200 bytes (partial message)
+        let mut partial = encoded.split_to(200);
+
+        // Try to decode - should return None (incomplete)
+        let result = decoder.decode(&mut partial).unwrap();
+        assert!(result.is_none());
+
+        // Abort the message on this CSID
+        decoder.abort(CSID_VIDEO);
+
+        // Now send a new complete small message on the same CSID
+        let small_chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 100,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"new message"),
+        };
+
+        let mut new_encoded = BytesMut::new();
+        encoder.encode(&small_chunk, &mut new_encoded);
+
+        let decoded = decoder.decode(&mut new_encoded).unwrap().unwrap();
+        assert_eq!(decoded.payload.as_ref(), b"new message");
+    }
+
+    #[test]
+    fn test_decode_empty_buffer() {
+        let mut decoder = ChunkDecoder::new();
+        let mut buf = BytesMut::new();
+
+        let result = decoder.decode(&mut buf).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_multiple_messages_same_csid() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // First message
+        let chunk1 = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 0,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"first"),
+        };
+
+        // Second message (same CSID, uses header compression)
+        let chunk2 = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 100,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"second"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk1, &mut encoded);
+        encoder.encode(&chunk2, &mut encoded);
+
+        let decoded1 = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded1.payload.as_ref(), b"first");
+        assert_eq!(decoded1.timestamp, 0);
+
+        let decoded2 = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded2.payload.as_ref(), b"second");
+        assert_eq!(decoded2.timestamp, 100);
+    }
+
+    #[test]
+    fn test_interleaved_chunk_streams() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Interleave chunks from different streams
+        let video_chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"video"),
+        };
+
+        let audio_chunk = RtmpChunk {
+            csid: CSID_AUDIO,
+            timestamp: 0,
+            message_type: MSG_AUDIO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"audio"),
+        };
+
+        let command_chunk = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 0,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"command"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&video_chunk, &mut encoded);
+        encoder.encode(&audio_chunk, &mut encoded);
+        encoder.encode(&command_chunk, &mut encoded);
+
+        let decoded_video = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded_video.csid, CSID_VIDEO);
+        assert_eq!(decoded_video.message_type, MSG_VIDEO);
+
+        let decoded_audio = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded_audio.csid, CSID_AUDIO);
+        assert_eq!(decoded_audio.message_type, MSG_AUDIO);
+
+        let decoded_cmd = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded_cmd.csid, CSID_COMMAND);
+        assert_eq!(decoded_cmd.message_type, MSG_COMMAND_AMF0);
+    }
+
+    #[test]
+    fn test_message_too_large_error() {
+        let mut decoder = ChunkDecoder::new();
+        decoder.max_message_size = 100; // Set a small limit
+
+        // Create an encoded chunk with message length > 100
+        let mut encoder = ChunkEncoder::new();
+        let chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from(vec![0u8; 200]),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        // Decoding should fail with MessageTooLarge
+        let result = decoder.decode(&mut encoded);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("too large"));
+        }
+    }
+
+    #[test]
+    fn test_header_format_selection() {
+        let mut encoder = ChunkEncoder::new();
+        let mut buf = BytesMut::new();
+
+        // First message uses fmt 0 (full header)
+        let chunk1 = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 0,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"test"),
+        };
+        encoder.encode(&chunk1, &mut buf);
+
+        let first_byte = buf[0];
+        let fmt = (first_byte >> 6) & 0x03;
+        assert_eq!(fmt, 0, "First message should use fmt 0");
+
+        buf.clear();
+
+        // Same stream_id, same type, same length - should use compressed header
+        let chunk2 = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 100,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"test"), // Same length
+        };
+        encoder.encode(&chunk2, &mut buf);
+
+        let first_byte = buf[0];
+        let fmt = (first_byte >> 6) & 0x03;
+        // Should use fmt 2 (timestamp delta only) or fmt 3 (if delta matches)
+        assert!(fmt >= 2, "Subsequent message should use compressed header");
+    }
+
+    #[test]
+    fn test_timestamp_delta_wrapping() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Start near the timestamp wrap point
+        let chunk1 = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0xFFFFFFF0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"near wrap"),
+        };
+
+        // Timestamp wraps around
+        let chunk2 = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0x00000010, // Wrapped around
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from_static(b"after wrap"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk1, &mut encoded);
+        encoder.encode(&chunk2, &mut encoded);
+
+        let decoded1 = decoder.decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded1.timestamp, 0xFFFFFFF0);
+
+        // The second timestamp calculation involves wrapping arithmetic
+        let decoded2 = decoder.decode(&mut encoded).unwrap().unwrap();
+        // Just verify it decoded without error; exact value depends on implementation
+        assert!(decoded2.timestamp != 0xFFFFFFF0);
+    }
+
+    #[test]
+    fn test_custom_chunk_size_encoding_decoding() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        // Use a larger chunk size to reduce fragmentation
+        encoder.set_chunk_size(1024);
+        decoder.set_chunk_size(1024);
+
+        let payload = vec![0u8; 2000]; // Would be 16 chunks at 128, but only 2 at 1024
+        let chunk = RtmpChunk {
+            csid: CSID_VIDEO,
+            timestamp: 0,
+            message_type: MSG_VIDEO,
+            stream_id: 1,
+            payload: Bytes::from(payload),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        // Should be smaller than with default chunk size due to fewer headers
+        let decoded = loop {
+            if let Some(c) = decoder.decode(&mut encoded).unwrap() {
+                break c;
+            }
+        };
+        assert_eq!(decoded.payload.len(), 2000);
+    }
+
+    #[test]
+    fn test_incremental_decoding() {
+        let mut encoder = ChunkEncoder::new();
+        let mut decoder = ChunkDecoder::new();
+
+        let chunk = RtmpChunk {
+            csid: CSID_COMMAND,
+            timestamp: 500,
+            message_type: MSG_COMMAND_AMF0,
+            stream_id: 0,
+            payload: Bytes::from_static(b"test payload for incremental decode"),
+        };
+
+        let mut encoded = BytesMut::new();
+        encoder.encode(&chunk, &mut encoded);
+
+        // Feed one byte at a time to test incremental decoding
+        let mut partial = BytesMut::new();
+        let mut decoded_chunk = None;
+
+        for byte in encoded.iter() {
+            partial.put_u8(*byte);
+            if let Some(c) = decoder.decode(&mut partial).unwrap() {
+                decoded_chunk = Some(c);
+                break;
+            }
+        }
+
+        assert!(decoded_chunk.is_some());
+        let decoded = decoded_chunk.unwrap();
+        assert_eq!(decoded.timestamp, 500);
+        assert_eq!(
+            decoded.payload.as_ref(),
+            b"test payload for incremental decode"
+        );
+    }
+}
